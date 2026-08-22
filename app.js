@@ -601,7 +601,7 @@ const languageFlags = {
 // Google Fonts configuration
 const googleFonts = {
     loaded: new Set(),
-    loading: new Set(),
+    loading: new Map(),
     // Popular fonts that are commonly used for marketing/app store
     popular: [
         'Inter', 'Poppins', 'Roboto', 'Open Sans', 'Montserrat', 'Lato', 'Raleway',
@@ -642,6 +642,10 @@ const googleFonts = {
     allFonts: null
 };
 
+let loadedStateFontSignature = '';
+let loadingStateFontSignature = '';
+let stateFontLoadPromise = null;
+
 // Load a Google Font dynamically
 async function loadGoogleFont(fontName) {
     // Check if it's a system font
@@ -660,19 +664,11 @@ async function loadGoogleFont(fontName) {
         return;
     }
 
-    // If currently loading, wait for it
-    if (googleFonts.loading.has(fontName)) {
-        // Wait a bit and check again
-        await new Promise(resolve => setTimeout(resolve, 100));
-        if (googleFonts.loading.has(fontName)) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-        return;
-    }
+    // Reuse the real in-flight promise so every caller waits for the font face,
+    // rather than guessing with a timeout and potentially drawing too early.
+    if (googleFonts.loading.has(fontName)) return googleFonts.loading.get(fontName);
 
-    googleFonts.loading.add(fontName);
-
-    try {
+    const loadPromise = (async () => {
         const link = document.createElement('link');
         link.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(fontName)}:wght@300;400;500;600;700;800;900&display=swap`;
         link.rel = 'stylesheet';
@@ -697,11 +693,95 @@ async function loadGoogleFont(fontName) {
         ]);
 
         googleFonts.loaded.add(fontName);
-        googleFonts.loading.delete(fontName);
+    })();
+    googleFonts.loading.set(fontName, loadPromise);
+
+    try {
+        await loadPromise;
     } catch (error) {
         console.warn(`Failed to load font: ${fontName}`, error);
+    } finally {
         googleFonts.loading.delete(fontName);
     }
+}
+
+function getGoogleFontName(fontValue) {
+    if (!fontValue || typeof fontValue !== 'string') return null;
+    if (googleFonts.system.some(font => font.name === fontValue || font.value === fontValue)) {
+        return null;
+    }
+
+    const quotedFamily = fontValue.match(/['"]([^'"]+)['"]/);
+    return (quotedFamily ? quotedFamily[1] : fontValue.split(',')[0]).trim() || null;
+}
+
+function getStateFontRequests() {
+    const requests = new Map();
+    const add = (fontValue, weight = '400') => {
+        const fontName = getGoogleFontName(fontValue);
+        if (!fontName) return;
+        if (!requests.has(fontName)) requests.set(fontName, new Set());
+        requests.get(fontName).add(String(weight || '400'));
+    };
+
+    (state.screenshots || []).forEach(screenshot => {
+        const text = screenshot.text || {};
+        add(text.headlineFont, text.headlineWeight);
+        add(text.subheadlineFont || text.headlineFont, text.subheadlineWeight);
+        (screenshot.elements || []).forEach(element => {
+            if (element.type === 'text') add(element.font, element.fontWeight);
+        });
+    });
+
+    return requests;
+}
+
+function getFontRequestSignature(requests) {
+    return [...requests.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([fontName, weights]) => `${fontName}:${[...weights].sort().join(',')}`)
+        .join('|');
+}
+
+async function loadFontsForState() {
+    const requests = getStateFontRequests();
+    const signature = getFontRequestSignature(requests);
+    if (signature === loadedStateFontSignature) return true;
+    if (signature === loadingStateFontSignature && stateFontLoadPromise) {
+        return stateFontLoadPromise;
+    }
+
+    loadingStateFontSignature = signature;
+    stateFontLoadPromise = (async () => {
+        await Promise.all([...requests.entries()].map(async ([fontName, weights]) => {
+            await loadGoogleFont(fontName);
+            await Promise.all([...weights].map(weight =>
+                document.fonts.load(`${weight} 16px "${fontName}"`)
+            ));
+        }));
+        await document.fonts.ready;
+
+        const loaded = [...requests.entries()].every(([fontName, weights]) =>
+            [...weights].every(weight => document.fonts.check(`${weight} 16px "${fontName}"`))
+        );
+        if (loaded) loadedStateFontSignature = signature;
+        return loaded;
+    })().finally(() => {
+        if (loadingStateFontSignature === signature) {
+            loadingStateFontSignature = '';
+            stateFontLoadPromise = null;
+        }
+    });
+
+    return stateFontLoadPromise;
+}
+
+function scheduleFontAwareRedraw() {
+    const signature = getFontRequestSignature(getStateFontRequests());
+    if (signature === loadedStateFontSignature || signature === loadingStateFontSignature) return;
+    loadFontsForState().then(loaded => {
+        if (loaded) updateCanvas();
+    });
 }
 
 // Fetch all Google Fonts from the API (cached)
@@ -1462,6 +1542,7 @@ async function init() {
         await openDatabase();
         await loadProjectsMeta();
         await loadState();
+        await loadFontsForState();
         syncUIWithState();
         updateCanvas();
     } catch (e) {
@@ -1943,6 +2024,7 @@ async function switchProject(projectId) {
     // Reset and load new project
     resetStateToDefaults();
     await loadState();
+    await loadFontsForState();
 
     syncUIWithState();
     updateScreenshotList();
@@ -6853,6 +6935,7 @@ function updateCanvas() {
 
     // Update side previews
     updateSidePreviews();
+    scheduleFontAwareRedraw();
 }
 
 function updateSidePreviews() {
