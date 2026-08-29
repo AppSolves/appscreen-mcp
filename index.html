@@ -19,7 +19,7 @@
     <link rel="icon"
         href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23667eea'/><rect x='20' y='30' width='60' height='45' rx='5' fill='white'/><circle cx='50' cy='20' r='5' fill='white'/></svg>">
 
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=20260823.4">
 
     <!-- Detect Tauri and add class for native styling -->
     <script>
@@ -243,6 +243,10 @@
                                     <span class="device-option-size">1242 × 2208</span>
                                 </div>
                                 <div class="output-size-divider"></div>
+                                <div class="device-option" data-device="ipad-13">
+                                    <span class="device-option-name">iPad 13&quot;</span>
+                                    <span class="device-option-size">2064 × 2752</span>
+                                </div>
                                 <div class="device-option" data-device="ipad-12.9">
                                     <span class="device-option-name">iPad 12.9"</span>
                                     <span class="device-option-size">2048 × 2732</span>
@@ -633,6 +637,25 @@
                 <!-- Screenshot Tab -->
                 <div class="tab-content" id="tab-screenshot">
                     <div class="control-group">
+                        <label class="control-label" for="device-instance-selector">Device Instance</label>
+                        <select id="device-instance-selector" class="control-select" style="width: 100%; margin-bottom: 8px;">
+                            <option value="primary">Device 1</option>
+                        </select>
+                        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                            <button type="button" id="add-secondary-device" class="shared-3d-button" style="flex: 1; min-width: 150px;">
+                                <span>+ Add second device</span>
+                            </button>
+                            <button type="button" id="remove-secondary-device" class="shared-3d-button" style="display: none; flex: 1; min-width: 130px;">
+                                <span>Remove device</span>
+                            </button>
+                            <button type="button" id="replace-device-image" class="shared-3d-button" style="flex: 1 0 100%;">
+                                <span>Replace selected device content</span>
+                            </button>
+                            <input type="file" id="replace-device-image-input" accept="image/*" hidden>
+                        </div>
+                    </div>
+
+                    <div class="control-group">
                         <label class="control-label">Device Type</label>
                         <div class="btn-group" id="device-type-selector">
                             <button class="active" data-type="2d">2D</button>
@@ -652,21 +675,62 @@
                             <label class="control-label">Rotation X (Tilt)</label>
                             <div class="control-row">
                                 <input type="range" id="rotation-3d-x" min="-45" max="45" value="0">
-                                <span class="range-value" id="rotation-3d-x-value">0°</span>
+                                <div class="range-number-value">
+                                    <input type="number" id="rotation-3d-x-value" value="0" step="any"
+                                        aria-label="Rotation X in degrees">
+                                    <span>°</span>
+                                </div>
                             </div>
                         </div>
                         <div class="control-group">
                             <label class="control-label">Rotation Y (Turn)</label>
                             <div class="control-row">
                                 <input type="range" id="rotation-3d-y" min="-45" max="45" value="0">
-                                <span class="range-value" id="rotation-3d-y-value">0°</span>
+                                <div class="range-number-value">
+                                    <input type="number" id="rotation-3d-y-value" value="0" step="any"
+                                        aria-label="Rotation Y in degrees">
+                                    <span>°</span>
+                                </div>
                             </div>
                         </div>
                         <div class="control-group">
                             <label class="control-label">Rotation Z (Roll)</label>
                             <div class="control-row">
                                 <input type="range" id="rotation-3d-z" min="-45" max="45" value="0">
-                                <span class="range-value" id="rotation-3d-z-value">0°</span>
+                                <div class="range-number-value">
+                                    <input type="number" id="rotation-3d-z-value" value="0" step="any"
+                                        aria-label="Rotation Z in degrees">
+                                    <span>°</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="control-group shared-3d-control">
+                            <label class="control-label">Multi-Screen Device</label>
+                            <button type="button" id="shared-3d-toggle" class="shared-3d-button">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                                    stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                                    stroke-linejoin="round" aria-hidden="true">
+                                    <rect x="3" y="5" width="7" height="14" rx="1.5"></rect>
+                                    <rect x="14" y="5" width="7" height="14" rx="1.5"></rect>
+                                    <path d="M10 12h4"></path>
+                                </svg>
+                                <span id="shared-3d-toggle-label">Continue onto next screen</span>
+                            </button>
+                            <p class="shared-3d-status" id="shared-3d-status">
+                                Render one continuous perspective across two screenshots.
+                            </p>
+                            <div id="shared-3d-gap-control" class="shared-3d-gap-control" style="display: none;">
+                                <label class="control-label" for="shared-3d-gap">Screenshot Gap</label>
+                                <div class="control-row">
+                                    <input type="range" id="shared-3d-gap" min="0" max="20" step="0.1"
+                                        value="3.1">
+                                    <div class="range-number-value">
+                                        <input type="number" id="shared-3d-gap-value" min="0" value="3.1"
+                                            step="any" aria-label="Gap as a percentage of screenshot width">
+                                        <span>%</span>
+                                    </div>
+                                </div>
+                                <p class="shared-3d-status">Width skipped between the two rendered screenshots.</p>
                             </div>
                         </div>
                     </div>
@@ -753,7 +817,11 @@
                         <label class="control-label">Vertical Position</label>
                         <div class="control-row">
                             <input type="range" id="screenshot-y" min="-80" max="180" value="55">
-                            <span class="range-value" id="screenshot-y-value">55%</span>
+                            <div class="range-number-value">
+                                <input type="number" id="screenshot-y-value" value="55" step="any"
+                                    aria-label="Vertical position percentage">
+                                <span>%</span>
+                            </div>
                         </div>
                     </div>
 
@@ -761,7 +829,11 @@
                         <label class="control-label">Horizontal Position</label>
                         <div class="control-row">
                             <input type="range" id="screenshot-x" min="-80" max="180" value="50">
-                            <span class="range-value" id="screenshot-x-value">50%</span>
+                            <div class="range-number-value">
+                                <input type="number" id="screenshot-x-value" value="50" step="any"
+                                    aria-label="Horizontal position percentage">
+                                <span>%</span>
+                            </div>
                         </div>
                     </div>
 
@@ -785,7 +857,11 @@
                             <label class="control-label">Tilt / Rotation</label>
                             <div class="control-row">
                                 <input type="range" id="screenshot-rotation" min="-45" max="45" value="0">
-                                <span class="range-value" id="screenshot-rotation-value">0°</span>
+                                <div class="range-number-value">
+                                    <input type="number" id="screenshot-rotation-value" value="0" step="any"
+                                        aria-label="Device rotation in degrees">
+                                    <span>°</span>
+                                </div>
                             </div>
                         </div>
 
@@ -2147,13 +2223,13 @@
         </div>
     </div>
 
-    <script src="llm.js"></script>
-    <script src="language-utils.js"></script>
-    <script src="magical-titles.js"></script>
-    <script src="lucide-icons.js"></script>
-    <script src="three-renderer.js"></script>
-    <script src="app.js"></script>
-    <script src="mcp-bridge.js"></script>
+    <script src="llm.js?v=20260823.4"></script>
+    <script src="language-utils.js?v=20260823.4"></script>
+    <script src="magical-titles.js?v=20260823.4"></script>
+    <script src="lucide-icons.js?v=20260823.4"></script>
+    <script src="three-renderer.js?v=20260823.4"></script>
+    <script src="app.js?v=20260823.4"></script>
+    <script src="mcp-bridge.js?v=20260823.4"></script>
 </body>
 
 </html>

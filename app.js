@@ -103,6 +103,7 @@ const baseTextDefaults = JSON.parse(JSON.stringify(state.defaults.text));
 let selectedElementId = null;
 let selectedPopoutId = null;
 let draggingElement = null;
+let selectedDeviceSlot = 'primary';
 
 // Preload laurel SVG images for element frames
 const laurelImages = {};
@@ -125,7 +126,195 @@ function getBackground() {
 
 function getScreenshotSettings() {
     const screenshot = getCurrentScreenshot();
-    return screenshot ? screenshot.screenshot : state.defaults.screenshot;
+    if (!screenshot) return state.defaults.screenshot;
+    if (selectedDeviceSlot === 'secondary' && screenshot.secondaryDevice?.screenshot) {
+        return screenshot.secondaryDevice.screenshot;
+    }
+    return screenshot.screenshot;
+}
+
+function getDeviceImage(screenshot, slot = 'primary') {
+    if (!screenshot) return null;
+    if (slot === 'secondary') {
+        const device = screenshot.secondaryDevice;
+        if (!device) return null;
+        return getLocalizedImageFromMap(device.localizedImages, device.image);
+    }
+    return getScreenshotImage(screenshot);
+}
+
+function getLocalizedImageFromMap(localizedImages, legacyImage = null) {
+    const lang = state.currentLanguage;
+    if (localizedImages?.[lang]?.image) return localizedImages[lang].image;
+    for (const projectLanguage of state.projectLanguages) {
+        if (localizedImages?.[projectLanguage]?.image) return localizedImages[projectLanguage].image;
+    }
+    for (const localized of Object.values(localizedImages || {})) {
+        if (localized?.image) return localized.image;
+    }
+    return legacyImage || null;
+}
+
+function getRenderableDevices(screenshot) {
+    if (!screenshot) return [];
+    const devices = [{
+        slot: 'primary',
+        screenshot: screenshot.screenshot,
+        image: getDeviceImage(screenshot, 'primary')
+    }];
+    if (screenshot.secondaryDevice?.screenshot) {
+        devices.push({
+            slot: 'secondary',
+            screenshot: screenshot.secondaryDevice.screenshot,
+            image: getDeviceImage(screenshot, 'secondary')
+        });
+    }
+    return devices;
+}
+
+const SHARED_3D_SETTING_KEYS = new Set([
+    'use3D',
+    'device3D',
+    'scale',
+    'x',
+    'y',
+    'rotation3D',
+    'frameColor'
+]);
+const SHARED_3D_PREVIEW_GAP_PX = 10;
+
+function normalizeShared3DGapPercent(value) {
+    const numericValue = Number(value);
+    return Number.isFinite(numericValue) ? Math.max(0, numericValue) : 0;
+}
+
+function getDefaultShared3DGapPercent() {
+    const dims = getCanvasDimensions();
+    const previewScale = Math.min(400 / dims.width, 700 / dims.height);
+    const previewWidth = dims.width * previewScale;
+    return Number(((SHARED_3D_PREVIEW_GAP_PX / previewWidth) * 100).toFixed(2));
+}
+
+function getShared3DGroupMembers(groupId) {
+    if (!groupId) return [];
+    return state.screenshots
+        .map((screenshot, index) => ({ screenshot, index }))
+        .filter(({ screenshot }) => screenshot.screenshot?.shared3DView?.groupId === groupId);
+}
+
+function unlinkShared3DGroup(groupId) {
+    getShared3DGroupMembers(groupId).forEach(({ screenshot }) => {
+        delete screenshot.screenshot.shared3DView;
+    });
+}
+
+function repairShared3DGroups() {
+    const groupIds = new Set(
+        state.screenshots
+            .map(screenshot => screenshot.screenshot?.shared3DView?.groupId)
+            .filter(Boolean)
+    );
+
+    groupIds.forEach(groupId => {
+        const members = getShared3DGroupMembers(groupId).sort((a, b) => a.index - b.index);
+        const isValidPair = members.length === 2 && members[1].index === members[0].index + 1;
+        if (!isValidPair) {
+            unlinkShared3DGroup(groupId);
+            return;
+        }
+
+        const gapPercent = normalizeShared3DGapPercent(
+            members[0].screenshot.screenshot.shared3DView?.gapPercent
+                ?? members[1].screenshot.screenshot.shared3DView?.gapPercent
+                ?? getDefaultShared3DGapPercent()
+        );
+        members.forEach(({ screenshot }, tileIndex) => {
+            screenshot.screenshot.shared3DView = { groupId, tileIndex, tileCount: 2, gapPercent };
+        });
+    });
+}
+
+function setShared3DGapPercent(value) {
+    const settings = getScreenshotSettings();
+    const groupId = settings.shared3DView?.groupId;
+    if (!groupId) return;
+
+    const gapPercent = normalizeShared3DGapPercent(value);
+    getShared3DGroupMembers(groupId).forEach(({ screenshot }) => {
+        screenshot.screenshot.shared3DView.gapPercent = gapPercent;
+    });
+    updateShared3DControls();
+    updateCanvas();
+}
+
+function toggleShared3DWithNext() {
+    const current = getCurrentScreenshot();
+    if (!current) return;
+
+    const currentSettings = current.screenshot;
+    const currentGroupId = currentSettings.shared3DView?.groupId;
+    if (currentGroupId) {
+        unlinkShared3DGroup(currentGroupId);
+        syncUIWithState();
+        updateCanvas();
+        return;
+    }
+
+    const next = state.screenshots[state.selectedIndex + 1];
+    if (!next || !currentSettings.use3D) return;
+
+    const nextGroupId = next.screenshot?.shared3DView?.groupId;
+    if (nextGroupId) unlinkShared3DGroup(nextGroupId);
+
+    const nextSettings = next.screenshot;
+    const settingsToShare = ['use3D', 'device3D', 'scale', 'x', 'y', 'rotation3D', 'frameColor'];
+    settingsToShare.forEach(key => {
+        if (!Object.prototype.hasOwnProperty.call(currentSettings, key)) return;
+        nextSettings[key] = JSON.parse(JSON.stringify(currentSettings[key]));
+    });
+    nextSettings.use3D = true;
+
+    const groupId = crypto.randomUUID();
+    const gapPercent = getDefaultShared3DGapPercent();
+    currentSettings.shared3DView = { groupId, tileIndex: 0, tileCount: 2, gapPercent };
+    nextSettings.shared3DView = { groupId, tileIndex: 1, tileCount: 2, gapPercent };
+
+    syncUIWithState();
+    updateCanvas();
+}
+
+function updateShared3DControls() {
+    const button = document.getElementById('shared-3d-toggle');
+    const label = document.getElementById('shared-3d-toggle-label');
+    const status = document.getElementById('shared-3d-status');
+    const gapControl = document.getElementById('shared-3d-gap-control');
+    const gapSlider = document.getElementById('shared-3d-gap');
+    const gapInput = document.getElementById('shared-3d-gap-value');
+    if (!button || !label || !status || !gapControl || !gapSlider || !gapInput) return;
+
+    const settings = getScreenshotSettings();
+    const groupId = settings.shared3DView?.groupId;
+    const members = getShared3DGroupMembers(groupId).sort((a, b) => a.index - b.index);
+    const isLinked = members.length === 2;
+
+    button.classList.toggle('active', isLinked);
+    button.disabled = !isLinked && (!settings.use3D || state.selectedIndex >= state.screenshots.length - 1);
+    label.textContent = isLinked ? 'Unlink multi-screen device' : 'Continue onto next screen';
+    gapControl.style.display = isLinked ? 'block' : 'none';
+
+    if (isLinked) {
+        const gapPercent = normalizeShared3DGapPercent(settings.shared3DView.gapPercent);
+        syncSliderVisualToValue(gapSlider, gapPercent);
+        setUnboundedNumberControlValue('shared-3d-gap-value', gapPercent);
+    }
+
+    if (isLinked) {
+        status.textContent = `Shared camera across screens ${members[0].index + 1} and ${members[1].index + 1}. Device edits stay synchronized.`;
+    } else if (state.selectedIndex >= state.screenshots.length - 1) {
+        status.textContent = 'This is the final screen. Select an earlier screen to create a continuation.';
+    } else {
+        status.textContent = 'Render one continuous perspective across this and the next screenshot.';
+    }
 }
 
 function getText() {
@@ -213,6 +402,10 @@ function getSelectedElement() {
 }
 
 function getElementText(el) {
+    if (Array.isArray(el.visibleLanguages)
+        && !el.visibleLanguages.includes(state.currentLanguage)) {
+        return '';
+    }
     if (el.texts) {
         return el.texts[state.currentLanguage]
             || el.texts['en']
@@ -361,6 +554,7 @@ function addTextElement() {
         fontSize: 60,
         fontWeight: '600',
         fontColor: '#ffffff',
+        textAlign: 'center',
         italic: false,
         frame: 'none',
         frameColor: '#ffffff',
@@ -540,6 +734,37 @@ function formatValue(num) {
     return Number.isInteger(rounded) ? rounded.toString() : rounded.toFixed(1);
 }
 
+function setUnboundedNumberControlValue(inputId, value) {
+    const input = document.getElementById(inputId);
+    if (input) input.value = formatValue(value);
+}
+
+function syncSliderVisualToValue(slider, value) {
+    const min = Number.parseFloat(slider.min);
+    const max = Number.parseFloat(slider.max);
+    slider.value = Math.min(max, Math.max(min, value));
+}
+
+function bindUnboundedNumberControl(inputId, sliderId, readValue, applyValue) {
+    const input = document.getElementById(inputId);
+    const slider = document.getElementById(sliderId);
+    if (!input || !slider) return;
+
+    input.addEventListener('input', () => {
+        if (!input.value.trim()) return;
+        const value = Number.parseFloat(input.value);
+        if (!Number.isFinite(value)) return;
+
+        syncSliderVisualToValue(slider, value);
+        applyValue(value);
+    });
+
+    input.addEventListener('blur', () => {
+        const value = Number.parseFloat(input.value);
+        if (!Number.isFinite(value)) setUnboundedNumberControlValue(inputId, readValue());
+    });
+}
+
 function setBackground(key, value) {
     const screenshot = getCurrentScreenshot();
     if (screenshot) {
@@ -559,17 +784,122 @@ function setBackground(key, value) {
 function setScreenshotSetting(key, value) {
     const screenshot = getCurrentScreenshot();
     if (screenshot) {
-        if (key.includes('.')) {
+        const setValue = target => {
+            if (!key.includes('.')) {
+                target[key] = value;
+                return;
+            }
+
             const parts = key.split('.');
-            let obj = screenshot.screenshot;
+            let obj = target;
             for (let i = 0; i < parts.length - 1; i++) {
+                if (!obj[parts[i]] || typeof obj[parts[i]] !== 'object') obj[parts[i]] = {};
                 obj = obj[parts[i]];
             }
             obj[parts[parts.length - 1]] = value;
-        } else {
-            screenshot.screenshot[key] = value;
+        };
+
+        const targetSettings = selectedDeviceSlot === 'secondary' && screenshot.secondaryDevice?.screenshot
+            ? screenshot.secondaryDevice.screenshot
+            : screenshot.screenshot;
+        setValue(targetSettings);
+
+        const groupId = selectedDeviceSlot === 'primary'
+            ? screenshot.screenshot.shared3DView?.groupId
+            : null;
+        const shouldShare = SHARED_3D_SETTING_KEYS.has(key) || key.startsWith('rotation3D.');
+        if (groupId && shouldShare) {
+            getShared3DGroupMembers(groupId).forEach(({ screenshot: member }) => {
+                if (member !== screenshot) setValue(member.screenshot);
+            });
         }
     }
+}
+
+function cloneLocalizedImages(localizedImages) {
+    const clone = {};
+    Object.entries(localizedImages || {}).forEach(([language, localized]) => {
+        if (!localized?.src) return;
+        clone[language] = {
+            image: localized.image || null,
+            src: localized.src,
+            name: localized.name
+        };
+    });
+    return clone;
+}
+
+function addSecondaryDevice() {
+    const screenshot = getCurrentScreenshot();
+    if (!screenshot || screenshot.secondaryDevice) return;
+    const settings = JSON.parse(JSON.stringify(screenshot.screenshot));
+    delete settings.shared3DView;
+    screenshot.secondaryDevice = {
+        name: 'Device 2',
+        localizedImages: cloneLocalizedImages(screenshot.localizedImages),
+        screenshot: settings
+    };
+    selectedDeviceSlot = 'secondary';
+    syncUIWithState();
+    updateCanvas();
+}
+
+function removeSecondaryDevice() {
+    const screenshot = getCurrentScreenshot();
+    if (!screenshot?.secondaryDevice) return;
+    delete screenshot.secondaryDevice;
+    selectedDeviceSlot = 'primary';
+    syncUIWithState();
+    updateCanvas();
+}
+
+function updateDeviceInstanceControls() {
+    const screenshot = getCurrentScreenshot();
+    const selector = document.getElementById('device-instance-selector');
+    const addButton = document.getElementById('add-secondary-device');
+    const removeButton = document.getElementById('remove-secondary-device');
+    if (!selector || !addButton || !removeButton) return;
+
+    if (selectedDeviceSlot === 'secondary' && !screenshot?.secondaryDevice) {
+        selectedDeviceSlot = 'primary';
+    }
+
+    selector.innerHTML = '<option value="primary">Device 1</option>';
+    if (screenshot?.secondaryDevice) {
+        const option = document.createElement('option');
+        option.value = 'secondary';
+        option.textContent = screenshot.secondaryDevice.name || 'Device 2';
+        selector.appendChild(option);
+    }
+    selector.value = selectedDeviceSlot;
+    addButton.style.display = screenshot?.secondaryDevice ? 'none' : '';
+    removeButton.style.display = selectedDeviceSlot === 'secondary' ? '' : 'none';
+}
+
+function replaceSelectedDeviceImage(file) {
+    const screenshot = getCurrentScreenshot();
+    if (!screenshot || !file) return;
+    const reader = new FileReader();
+    reader.onload = event => {
+        const img = new Image();
+        img.onload = () => {
+            const language = state.currentLanguage || 'en';
+            const localized = { image: img, src: event.target.result, name: file.name };
+            if (selectedDeviceSlot === 'secondary' && screenshot.secondaryDevice) {
+                screenshot.secondaryDevice.localizedImages ||= {};
+                screenshot.secondaryDevice.localizedImages[language] = localized;
+                screenshot.secondaryDevice.image = img;
+            } else {
+                screenshot.localizedImages ||= {};
+                screenshot.localizedImages[language] = localized;
+                screenshot.image = img;
+            }
+            updateScreenshotList();
+            updateCanvas();
+        };
+        img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
 }
 
 function setTextSetting(key, value) {
@@ -601,7 +931,7 @@ const languageFlags = {
 // Google Fonts configuration
 const googleFonts = {
     loaded: new Set(),
-    loading: new Set(),
+    loading: new Map(),
     // Popular fonts that are commonly used for marketing/app store
     popular: [
         'Inter', 'Poppins', 'Roboto', 'Open Sans', 'Montserrat', 'Lato', 'Raleway',
@@ -642,6 +972,10 @@ const googleFonts = {
     allFonts: null
 };
 
+let loadedStateFontSignature = '';
+let loadingStateFontSignature = '';
+let stateFontLoadPromise = null;
+
 // Load a Google Font dynamically
 async function loadGoogleFont(fontName) {
     // Check if it's a system font
@@ -660,19 +994,11 @@ async function loadGoogleFont(fontName) {
         return;
     }
 
-    // If currently loading, wait for it
-    if (googleFonts.loading.has(fontName)) {
-        // Wait a bit and check again
-        await new Promise(resolve => setTimeout(resolve, 100));
-        if (googleFonts.loading.has(fontName)) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-        }
-        return;
-    }
+    // Reuse the real in-flight promise so every caller waits for the font face,
+    // rather than guessing with a timeout and potentially drawing too early.
+    if (googleFonts.loading.has(fontName)) return googleFonts.loading.get(fontName);
 
-    googleFonts.loading.add(fontName);
-
-    try {
+    const loadPromise = (async () => {
         const link = document.createElement('link');
         link.href = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(fontName)}:wght@300;400;500;600;700;800;900&display=swap`;
         link.rel = 'stylesheet';
@@ -697,11 +1023,95 @@ async function loadGoogleFont(fontName) {
         ]);
 
         googleFonts.loaded.add(fontName);
-        googleFonts.loading.delete(fontName);
+    })();
+    googleFonts.loading.set(fontName, loadPromise);
+
+    try {
+        await loadPromise;
     } catch (error) {
         console.warn(`Failed to load font: ${fontName}`, error);
+    } finally {
         googleFonts.loading.delete(fontName);
     }
+}
+
+function getGoogleFontName(fontValue) {
+    if (!fontValue || typeof fontValue !== 'string') return null;
+    if (googleFonts.system.some(font => font.name === fontValue || font.value === fontValue)) {
+        return null;
+    }
+
+    const quotedFamily = fontValue.match(/['"]([^'"]+)['"]/);
+    return (quotedFamily ? quotedFamily[1] : fontValue.split(',')[0]).trim() || null;
+}
+
+function getStateFontRequests() {
+    const requests = new Map();
+    const add = (fontValue, weight = '400') => {
+        const fontName = getGoogleFontName(fontValue);
+        if (!fontName) return;
+        if (!requests.has(fontName)) requests.set(fontName, new Set());
+        requests.get(fontName).add(String(weight || '400'));
+    };
+
+    (state.screenshots || []).forEach(screenshot => {
+        const text = screenshot.text || {};
+        add(text.headlineFont, text.headlineWeight);
+        add(text.subheadlineFont || text.headlineFont, text.subheadlineWeight);
+        (screenshot.elements || []).forEach(element => {
+            if (element.type === 'text') add(element.font, element.fontWeight);
+        });
+    });
+
+    return requests;
+}
+
+function getFontRequestSignature(requests) {
+    return [...requests.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([fontName, weights]) => `${fontName}:${[...weights].sort().join(',')}`)
+        .join('|');
+}
+
+async function loadFontsForState() {
+    const requests = getStateFontRequests();
+    const signature = getFontRequestSignature(requests);
+    if (signature === loadedStateFontSignature) return true;
+    if (signature === loadingStateFontSignature && stateFontLoadPromise) {
+        return stateFontLoadPromise;
+    }
+
+    loadingStateFontSignature = signature;
+    stateFontLoadPromise = (async () => {
+        await Promise.all([...requests.entries()].map(async ([fontName, weights]) => {
+            await loadGoogleFont(fontName);
+            await Promise.all([...weights].map(weight =>
+                document.fonts.load(`${weight} 16px "${fontName}"`)
+            ));
+        }));
+        await document.fonts.ready;
+
+        const loaded = [...requests.entries()].every(([fontName, weights]) =>
+            [...weights].every(weight => document.fonts.check(`${weight} 16px "${fontName}"`))
+        );
+        if (loaded) loadedStateFontSignature = signature;
+        return loaded;
+    })().finally(() => {
+        if (loadingStateFontSignature === signature) {
+            loadingStateFontSignature = '';
+            stateFontLoadPromise = null;
+        }
+    });
+
+    return stateFontLoadPromise;
+}
+
+function scheduleFontAwareRedraw() {
+    const signature = getFontRequestSignature(getStateFontRequests());
+    if (signature === loadedStateFontSignature || signature === loadingStateFontSignature) return;
+    loadFontsForState().then(loaded => {
+        if (loaded) updateCanvas();
+    });
 }
 
 // Fetch all Google Fonts from the API (cached)
@@ -1240,6 +1650,7 @@ const deviceDimensions = {
     'iphone-6.7': { width: 1290, height: 2796 },
     'iphone-6.5': { width: 1284, height: 2778 },
     'iphone-5.5': { width: 1242, height: 2208 },
+    'ipad-13': { width: 2064, height: 2752 },
     'ipad-12.9': { width: 2048, height: 2732 },
     'ipad-11': { width: 1668, height: 2388 },
     'android-phone': { width: 1080, height: 1920 },
@@ -1462,6 +1873,7 @@ async function init() {
         await openDatabase();
         await loadProjectsMeta();
         await loadState();
+        await loadFontsForState();
         syncUIWithState();
         updateCanvas();
     } catch (e) {
@@ -1505,6 +1917,19 @@ function saveState() {
             });
         }
 
+        const secondaryDevice = s.secondaryDevice ? {
+            name: s.secondaryDevice.name || 'Device 2',
+            screenshot: s.secondaryDevice.screenshot,
+            localizedImages: Object.fromEntries(
+                Object.entries(s.secondaryDevice.localizedImages || {})
+                    .filter(([, localized]) => localized?.src)
+                    .map(([language, localized]) => [language, {
+                        src: localized.src,
+                        name: localized.name
+                    }])
+            )
+        } : undefined;
+
         return {
             src: s.image?.src || '', // Legacy compatibility
             name: s.name,
@@ -1512,6 +1937,7 @@ function saveState() {
             localizedImages: localizedImages,
             background: s.background,
             screenshot: s.screenshot,
+            secondaryDevice,
             text: s.text,
             elements: (s.elements || []).map(el => ({
                 ...el,
@@ -1592,6 +2018,27 @@ function reconstructElementImages(elements) {
     });
 }
 
+function reconstructSecondaryDevice(device) {
+    if (!device?.screenshot) return undefined;
+    const restored = {
+        name: device.name || 'Device 2',
+        screenshot: JSON.parse(JSON.stringify(device.screenshot)),
+        localizedImages: {}
+    };
+    Object.entries(device.localizedImages || {}).forEach(([language, localized]) => {
+        if (!localized?.src) return;
+        const img = new Image();
+        img.onload = () => updateCanvas();
+        img.src = localized.src;
+        restored.localizedImages[language] = {
+            image: img,
+            src: localized.src,
+            name: localized.name
+        };
+    });
+    return restored;
+}
+
 // Load state from IndexedDB for current project
 function loadState() {
     if (!db) return Promise.resolve();
@@ -1665,6 +2112,7 @@ function loadState() {
                                     localizedImages: {},
                                     background: s.background || JSON.parse(JSON.stringify(migratedBackground)),
                                     screenshot: screenshotSettings,
+                                    secondaryDevice: reconstructSecondaryDevice(s.secondaryDevice),
                                     text: s.text || JSON.parse(JSON.stringify(migratedText)),
                                     elements: reconstructElementImages(s.elements),
                                     popouts: s.popouts || [],
@@ -1704,6 +2152,7 @@ function loadState() {
                                                     localizedImages: localizedImages,
                                                     background: s.background || JSON.parse(JSON.stringify(migratedBackground)),
                                                     screenshot: screenshotSettings,
+                                                    secondaryDevice: reconstructSecondaryDevice(s.secondaryDevice),
                                                     text: s.text || JSON.parse(JSON.stringify(migratedText)),
                                                     elements: reconstructElementImages(s.elements),
                                                     popouts: s.popouts || [],
@@ -1749,6 +2198,7 @@ function loadState() {
                                         localizedImages: localizedImages,
                                         background: s.background || JSON.parse(JSON.stringify(migratedBackground)),
                                         screenshot: screenshotSettings,
+                                        secondaryDevice: reconstructSecondaryDevice(s.secondaryDevice),
                                         text: s.text || JSON.parse(JSON.stringify(migratedText)),
                                         elements: reconstructElementImages(s.elements),
                                         popouts: s.popouts || [],
@@ -1943,6 +2393,7 @@ async function switchProject(projectId) {
     // Reset and load new project
     resetStateToDefaults();
     await loadState();
+    await loadFontsForState();
 
     syncUIWithState();
     updateScreenshotList();
@@ -2035,6 +2486,74 @@ async function duplicateProject(sourceProjectId, customName) {
     });
 }
 
+const PORTABLE_PROJECT_SCHEMA_VERSION = 1;
+
+function isPlainObject(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function uniqueImportedProjectName(requestedName) {
+    const baseName = requestedName.trim() || 'Imported Project';
+    const existingNames = new Set(projects.map(project => project.name));
+    if (!existingNames.has(baseName)) return baseName;
+
+    let suffix = 2;
+    while (existingNames.has(`${baseName} (${suffix})`)) suffix++;
+    return `${baseName} (${suffix})`;
+}
+
+function portableProjectToDatabaseBackup(fileData) {
+    if (fileData.schemaVersion !== PORTABLE_PROJECT_SCHEMA_VERSION) {
+        throw new Error(`Unsupported project schema version: ${fileData.schemaVersion}.`);
+    }
+    if (typeof fileData.projectName !== 'string' || !fileData.projectName.trim()) {
+        throw new Error('Project name is missing.');
+    }
+    if (!isPlainObject(fileData.state) || !Array.isArray(fileData.state.screenshots)) {
+        throw new Error('Project state is missing or invalid.');
+    }
+    if (fileData.state.screenshots.some(screenshot => !isPlainObject(screenshot))) {
+        throw new Error('One or more project screenshots are invalid.');
+    }
+
+    const id = `project_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+    const name = uniqueImportedProjectName(fileData.projectName);
+    const importedState = JSON.parse(JSON.stringify(fileData.state));
+    delete importedState.currentProjectId;
+    importedState.id = id;
+    importedState.formatVersion = importedState.formatVersion || 2;
+
+    const importedMetadata = {
+        id,
+        name,
+        screenshotCount: importedState.screenshots.length
+    };
+
+    return {
+        projects: [importedState],
+        meta: [
+            { key: 'projects', value: [...projects, importedMetadata] },
+            { key: 'currentProject', value: id }
+        ]
+    };
+}
+
+function normalizeProjectImport(fileData) {
+    if (!isPlainObject(fileData)) {
+        throw new Error('The selected file is not an AppScreen project.');
+    }
+
+    if (fileData.schemaVersion !== undefined && fileData.state !== undefined) {
+        return portableProjectToDatabaseBackup(fileData);
+    }
+
+    if (Array.isArray(fileData.projects) && Array.isArray(fileData.meta)) {
+        return fileData;
+    }
+
+    throw new Error('The selected JSON file is not a supported AppScreen project or backup.');
+}
+
 function duplicateScreenshot(index) {
     const original = state.screenshots[index];
     if (!original) return;
@@ -2044,9 +2563,14 @@ function duplicateScreenshot(index) {
         deviceType: original.deviceType,
         background: original.background,
         screenshot: original.screenshot,
+        secondaryDevice: original.secondaryDevice,
         text: original.text,
         overrides: original.overrides
     }));
+    if (clone.screenshot) delete clone.screenshot.shared3DView;
+    if (clone.secondaryDevice) {
+        clone.secondaryDevice = reconstructSecondaryDevice(clone.secondaryDevice);
+    }
 
     const nameParts = clone.name.split('.');
     if (nameParts.length > 1) {
@@ -2127,6 +2651,8 @@ function updateFrameColorSwatches(deviceType, activeColorId) {
 
 // Sync UI controls with current state
 function syncUIWithState() {
+    repairShared3DGroups();
+
     // Update language button
     updateLanguageButton();
 
@@ -2153,6 +2679,7 @@ function syncUIWithState() {
     document.getElementById('custom-height').value = state.customHeight;
 
     // Get current screenshot's settings
+    updateDeviceInstanceControls();
     const bg = getBackground();
     const ss = getScreenshotSettings();
     const txt = getText();
@@ -2192,13 +2719,13 @@ function syncUIWithState() {
     document.getElementById('screenshot-scale').value = ss.scale;
     document.getElementById('screenshot-scale-value').textContent = formatValue(ss.scale) + '%';
     document.getElementById('screenshot-y').value = ss.y;
-    document.getElementById('screenshot-y-value').textContent = formatValue(ss.y) + '%';
+    setUnboundedNumberControlValue('screenshot-y-value', ss.y);
     document.getElementById('screenshot-x').value = ss.x;
-    document.getElementById('screenshot-x-value').textContent = formatValue(ss.x) + '%';
+    setUnboundedNumberControlValue('screenshot-x-value', ss.x);
     document.getElementById('corner-radius').value = ss.cornerRadius;
     document.getElementById('corner-radius-value').textContent = formatValue(ss.cornerRadius) + 'px';
     document.getElementById('screenshot-rotation').value = ss.rotation;
-    document.getElementById('screenshot-rotation-value').textContent = formatValue(ss.rotation) + '°';
+    setUnboundedNumberControlValue('screenshot-rotation-value', ss.rotation);
 
     // Shadow
     document.getElementById('shadow-toggle').classList.toggle('active', ss.shadow.enabled);
@@ -2290,17 +2817,18 @@ function syncUIWithState() {
     updateFrameColorSwatches(device3D, ss.frameColor);
     document.getElementById('rotation-3d-options').style.display = use3D ? 'block' : 'none';
     document.getElementById('rotation-3d-x').value = rotation3D.x;
-    document.getElementById('rotation-3d-x-value').textContent = formatValue(rotation3D.x) + '°';
+    setUnboundedNumberControlValue('rotation-3d-x-value', rotation3D.x);
     document.getElementById('rotation-3d-y').value = rotation3D.y;
-    document.getElementById('rotation-3d-y-value').textContent = formatValue(rotation3D.y) + '°';
+    setUnboundedNumberControlValue('rotation-3d-y-value', rotation3D.y);
     document.getElementById('rotation-3d-z').value = rotation3D.z;
-    document.getElementById('rotation-3d-z-value').textContent = formatValue(rotation3D.z) + '°';
+    setUnboundedNumberControlValue('rotation-3d-z-value', rotation3D.z);
 
     // Hide 2D-only settings in 3D mode, show 3D tip
     document.getElementById('2d-only-settings').style.display = use3D ? 'none' : 'block';
     document.getElementById('position-presets-section').style.display = use3D ? 'none' : 'block';
     document.getElementById('frame-color-section').style.display = use3D ? 'block' : 'none';
     document.getElementById('3d-tip').style.display = use3D ? 'flex' : 'none';
+    updateShared3DControls();
 
     // Show/hide 3D renderer and switch model if needed
     if (typeof showThreeJS === 'function') {
@@ -3592,6 +4120,22 @@ function setupPopoutEventListeners() {
 }
 
 function setupEventListeners() {
+    document.getElementById('device-instance-selector').addEventListener('change', event => {
+        selectedDeviceSlot = event.target.value === 'secondary' ? 'secondary' : 'primary';
+        syncUIWithState();
+        updateCanvas();
+    });
+    document.getElementById('add-secondary-device').addEventListener('click', addSecondaryDevice);
+    document.getElementById('remove-secondary-device').addEventListener('click', removeSecondaryDevice);
+    document.getElementById('replace-device-image').addEventListener('click', () => {
+        document.getElementById('replace-device-image-input').click();
+    });
+    document.getElementById('replace-device-image-input').addEventListener('change', event => {
+        const [file] = event.target.files || [];
+        if (file) replaceSelectedDeviceImage(file);
+        event.target.value = '';
+    });
+
     // Collapsible toggle rows
     document.querySelectorAll('.toggle-row.collapsible').forEach(row => {
         row.addEventListener('click', (e) => {
@@ -3820,7 +4364,7 @@ function setupEventListeners() {
         if (!file || !db) return;
         try {
             const text = await file.text();
-            const dump = JSON.parse(text);
+            const dump = normalizeProjectImport(JSON.parse(text));
             for (const storeName of Object.keys(dump)) {
                 if (!db.objectStoreNames.contains(storeName)) continue;
                 const tx = db.transaction(storeName, 'readwrite');
@@ -4333,15 +4877,35 @@ function setupEventListeners() {
 
     document.getElementById('screenshot-y').addEventListener('input', (e) => {
         setScreenshotSetting('y', parseInt(e.target.value));
-        document.getElementById('screenshot-y-value').textContent = formatValue(e.target.value) + '%';
+        setUnboundedNumberControlValue('screenshot-y-value', e.target.value);
         updateCanvas();
     });
 
+    bindUnboundedNumberControl(
+        'screenshot-y-value',
+        'screenshot-y',
+        () => getScreenshotSettings().y,
+        value => {
+            setScreenshotSetting('y', value);
+            updateCanvas();
+        }
+    );
+
     document.getElementById('screenshot-x').addEventListener('input', (e) => {
         setScreenshotSetting('x', parseInt(e.target.value));
-        document.getElementById('screenshot-x-value').textContent = formatValue(e.target.value) + '%';
+        setUnboundedNumberControlValue('screenshot-x-value', e.target.value);
         updateCanvas();
     });
+
+    bindUnboundedNumberControl(
+        'screenshot-x-value',
+        'screenshot-x',
+        () => getScreenshotSettings().x,
+        value => {
+            setScreenshotSetting('x', value);
+            updateCanvas();
+        }
+    );
 
     document.getElementById('corner-radius').addEventListener('input', (e) => {
         setScreenshotSetting('cornerRadius', parseInt(e.target.value));
@@ -4351,9 +4915,19 @@ function setupEventListeners() {
 
     document.getElementById('screenshot-rotation').addEventListener('input', (e) => {
         setScreenshotSetting('rotation', parseInt(e.target.value));
-        document.getElementById('screenshot-rotation-value').textContent = formatValue(e.target.value) + '°';
+        setUnboundedNumberControlValue('screenshot-rotation-value', e.target.value);
         updateCanvas();
     });
+
+    bindUnboundedNumberControl(
+        'screenshot-rotation-value',
+        'screenshot-rotation',
+        () => getScreenshotSettings().rotation,
+        value => {
+            setScreenshotSetting('rotation', value);
+            updateCanvas();
+        }
+    );
 
     // Shadow toggle
     document.getElementById('shadow-toggle').addEventListener('click', function () {
@@ -4632,6 +5206,7 @@ function setupEventListeners() {
             document.getElementById('position-presets-section').style.display = use3D ? 'none' : 'block';
             document.getElementById('frame-color-section').style.display = use3D ? 'block' : 'none';
             document.getElementById('3d-tip').style.display = use3D ? 'flex' : 'none';
+            updateShared3DControls();
 
             if (typeof showThreeJS === 'function') {
                 showThreeJS(use3D);
@@ -4644,6 +5219,17 @@ function setupEventListeners() {
             updateCanvas();
         });
     });
+
+    document.getElementById('shared-3d-toggle').addEventListener('click', toggleShared3DWithNext);
+    document.getElementById('shared-3d-gap').addEventListener('input', event => {
+        setShared3DGapPercent(event.target.value);
+    });
+    bindUnboundedNumberControl(
+        'shared-3d-gap-value',
+        'shared-3d-gap',
+        () => getScreenshotSettings().shared3DView?.gapPercent ?? getDefaultShared3DGapPercent(),
+        value => setShared3DGapPercent(value)
+    );
 
     // 3D device model selector
     document.querySelectorAll('#device-3d-selector button').forEach(btn => {
@@ -4674,37 +5260,29 @@ function setupEventListeners() {
     });
 
     // 3D rotation controls
-    document.getElementById('rotation-3d-x').addEventListener('input', (e) => {
+    const apply3DRotation = (axis, value) => {
+        setScreenshotSetting(`rotation3D.${axis}`, value);
         const ss = getScreenshotSettings();
-        if (!ss.rotation3D) ss.rotation3D = { x: 0, y: 0, z: 0 };
-        ss.rotation3D.x = parseInt(e.target.value);
-        document.getElementById('rotation-3d-x-value').textContent = formatValue(e.target.value) + '°';
         if (typeof setThreeJSRotation === 'function') {
             setThreeJSRotation(ss.rotation3D.x, ss.rotation3D.y, ss.rotation3D.z);
         }
         updateCanvas(); // Keep export canvas in sync
-    });
+    };
 
-    document.getElementById('rotation-3d-y').addEventListener('input', (e) => {
-        const ss = getScreenshotSettings();
-        if (!ss.rotation3D) ss.rotation3D = { x: 0, y: 0, z: 0 };
-        ss.rotation3D.y = parseInt(e.target.value);
-        document.getElementById('rotation-3d-y-value').textContent = formatValue(e.target.value) + '°';
-        if (typeof setThreeJSRotation === 'function') {
-            setThreeJSRotation(ss.rotation3D.x, ss.rotation3D.y, ss.rotation3D.z);
-        }
-        updateCanvas(); // Keep export canvas in sync
-    });
-
-    document.getElementById('rotation-3d-z').addEventListener('input', (e) => {
-        const ss = getScreenshotSettings();
-        if (!ss.rotation3D) ss.rotation3D = { x: 0, y: 0, z: 0 };
-        ss.rotation3D.z = parseInt(e.target.value);
-        document.getElementById('rotation-3d-z-value').textContent = formatValue(e.target.value) + '°';
-        if (typeof setThreeJSRotation === 'function') {
-            setThreeJSRotation(ss.rotation3D.x, ss.rotation3D.y, ss.rotation3D.z);
-        }
-        updateCanvas(); // Keep export canvas in sync
+    ['x', 'y', 'z'].forEach(axis => {
+        const sliderId = `rotation-3d-${axis}`;
+        const inputId = `${sliderId}-value`;
+        document.getElementById(sliderId).addEventListener('input', e => {
+            const value = Number.parseFloat(e.target.value);
+            apply3DRotation(axis, value);
+            setUnboundedNumberControlValue(inputId, value);
+        });
+        bindUnboundedNumberControl(
+            inputId,
+            sliderId,
+            () => getScreenshotSettings().rotation3D?.[axis] || 0,
+            value => apply3DRotation(axis, value)
+        );
     });
 }
 
@@ -5996,11 +6574,11 @@ function applyPositionPreset(preset) {
     document.getElementById('screenshot-scale').value = p.scale;
     document.getElementById('screenshot-scale-value').textContent = formatValue(p.scale) + '%';
     document.getElementById('screenshot-x').value = p.x;
-    document.getElementById('screenshot-x-value').textContent = formatValue(p.x) + '%';
+    setUnboundedNumberControlValue('screenshot-x-value', p.x);
     document.getElementById('screenshot-y').value = p.y;
-    document.getElementById('screenshot-y-value').textContent = formatValue(p.y) + '%';
+    setUnboundedNumberControlValue('screenshot-y-value', p.y);
     document.getElementById('screenshot-rotation').value = p.rotation;
-    document.getElementById('screenshot-rotation-value').textContent = formatValue(p.rotation) + '°';
+    setUnboundedNumberControlValue('screenshot-rotation-value', p.rotation);
 
     updateCanvas();
 }
@@ -6797,7 +7375,30 @@ function getCanvasDimensions() {
     return deviceDimensions[state.outputDevice];
 }
 
+function renderDeviceInstancesToCanvas(targetCanvas, targetContext, dims, screenshotIndex) {
+    const screenshot = state.screenshots[screenshotIndex];
+    if (!screenshot) return;
+    getRenderableDevices(screenshot).forEach(device => {
+        if (!device.image) return;
+        if (device.screenshot.use3D) {
+            if (typeof renderThreeJSForScreenshot === 'function' && phoneModelLoaded) {
+                renderThreeJSForScreenshot(
+                    targetCanvas,
+                    dims.width,
+                    dims.height,
+                    screenshotIndex,
+                    device.screenshot,
+                    device.image
+                );
+            }
+        } else {
+            drawScreenshotToContext(targetContext, dims, device.image, device.screenshot);
+        }
+    });
+}
+
 function updateCanvas() {
+    repairShared3DGroups();
     saveState(); // Persist state on every update
     const dims = getCanvasDimensions();
     canvas.width = dims.width;
@@ -6821,22 +7422,9 @@ function updateCanvas() {
     // Elements behind screenshot
     drawElements(ctx, dims, 'behind-screenshot');
 
-    // Draw screenshot (2D mode) or 3D phone model
+    // Draw all configured device instances in order.
     if (state.screenshots.length > 0) {
-        const screenshot = state.screenshots[state.selectedIndex];
-        const img = screenshot ? getScreenshotImage(screenshot) : null;
-        const ss = getScreenshotSettings();
-        const use3D = ss.use3D || false;
-        if (use3D && img && typeof renderThreeJSToCanvas === 'function' && phoneModelLoaded) {
-            // In 3D mode, update the screen texture and render the phone model
-            if (typeof updateScreenTexture === 'function') {
-                updateScreenTexture();
-            }
-            renderThreeJSToCanvas(canvas, dims.width, dims.height);
-        } else if (!use3D) {
-            // In 2D mode, draw the screenshot normally
-            drawScreenshot();
-        }
+        renderDeviceInstancesToCanvas(canvas, ctx, dims, state.selectedIndex);
     }
 
     // Elements above screenshot but behind text
@@ -6853,6 +7441,7 @@ function updateCanvas() {
 
     // Update side previews
     updateSidePreviews();
+    scheduleFontAwareRedraw();
 }
 
 function updateSidePreviews() {
@@ -6863,7 +7452,9 @@ function updateSidePreviews() {
     const previewScale = Math.min(maxPreviewWidth / dims.width, maxPreviewHeight / dims.height);
 
     // Initialize Three.js if any screenshot uses 3D mode (needed for side previews)
-    const any3D = state.screenshots.some(s => s.screenshot?.use3D);
+    const any3D = state.screenshots.some(s =>
+        s.screenshot?.use3D || s.secondaryDevice?.screenshot?.use3D
+    );
     if (any3D && typeof showThreeJS === 'function') {
         showThreeJS(true);
 
@@ -6872,10 +7463,10 @@ function updateSidePreviews() {
             const adjacentIndices = [state.selectedIndex - 1, state.selectedIndex + 1]
                 .filter(i => i >= 0 && i < state.screenshots.length);
             adjacentIndices.forEach(i => {
-                const ss = state.screenshots[i]?.screenshot;
-                if (ss?.use3D && ss?.device3D) {
-                    loadCachedPhoneModel(ss.device3D);
-                }
+                const adjacent = state.screenshots[i];
+                [adjacent?.screenshot, adjacent?.secondaryDevice?.screenshot].forEach(ss => {
+                    if (ss?.use3D && ss?.device3D) loadCachedPhoneModel(ss.device3D);
+                });
             });
         }
     }
@@ -6960,10 +7551,12 @@ function slideToScreenshot(newIndex, direction) {
     const modelPromises = [];
     [newIndex, newPrevIndex, newNextIndex].forEach(index => {
         if (index >= 0 && index < state.screenshots.length) {
-            const ss = state.screenshots[index]?.screenshot;
-            if (ss?.use3D && ss?.device3D && typeof loadCachedPhoneModel === 'function') {
-                modelPromises.push(loadCachedPhoneModel(ss.device3D).catch(() => null));
-            }
+            const candidate = state.screenshots[index];
+            [candidate?.screenshot, candidate?.secondaryDevice?.screenshot].forEach(ss => {
+                if (ss?.use3D && ss?.device3D && typeof loadCachedPhoneModel === 'function') {
+                    modelPromises.push(loadCachedPhoneModel(ss.device3D).catch(() => null));
+                }
+            });
         }
     });
 
@@ -7048,6 +7641,7 @@ function renderScreenshotToCanvas(index, targetCanvas, targetCtx, dims, previewS
 
     // Get localized image for current language
     const img = getScreenshotImage(screenshot);
+    const settings = screenshot.screenshot;
 
     // Set canvas size (this also clears the canvas)
     targetCanvas.width = dims.width;
@@ -7072,19 +7666,8 @@ function renderScreenshotToCanvas(index, targetCanvas, targetCtx, dims, previewS
     // Elements behind screenshot
     drawElementsToContext(targetCtx, dims, elements, 'behind-screenshot');
 
-    // Draw screenshot - 3D if active for this screenshot, otherwise 2D
-    const settings = screenshot.screenshot;
-    const use3D = settings.use3D || false;
-
-    if (img) {
-        if (use3D && typeof renderThreeJSForScreenshot === 'function' && phoneModelLoaded) {
-            // Render 3D phone model for this specific screenshot
-            renderThreeJSForScreenshot(targetCanvas, dims.width, dims.height, index);
-        } else {
-            // Draw 2D screenshot using localized image
-            drawScreenshotToContext(targetCtx, dims, img, settings);
-        }
-    }
+    // Draw all configured device instances in order.
+    renderDeviceInstancesToCanvas(targetCanvas, targetCtx, dims, index);
 
     // Elements above screenshot
     drawElementsToContext(targetCtx, dims, elements, 'above-screenshot');
@@ -7471,15 +8054,44 @@ function drawElementsToContext(context, dims, elements, layer) {
             const elText = getElementText(el);
             if (!elText) { context.restore(); return; }
             const fontStyle = el.italic ? 'italic' : 'normal';
-            context.font = `${fontStyle} ${el.fontWeight} ${el.fontSize}px ${el.font}`;
+            let renderFontSize = el.fontSize;
+            const setRenderFont = () => {
+                context.font = `${fontStyle} ${el.fontWeight} ${renderFontSize}px ${el.font}`;
+            };
+            setRenderFont();
+
+            // Localized marketing copy can be substantially wider than its
+            // English source. Opt-in text layers shrink all manual lines by
+            // one shared factor, preserving typography without adding an
+            // accidental wrapped line that collides with nearby elements.
+            if (el.fitTextToWidth) {
+                const manualLines = String(elText).split(/\r?\n/);
+                const widestLine = Math.max(
+                    ...manualLines.map(line => context.measureText(line).width),
+                    0
+                );
+                if (widestLine > elWidth) {
+                    const minimumFontSize = Number.isFinite(el.minFontSize)
+                        ? el.minFontSize
+                        : 12;
+                    renderFontSize = Math.max(
+                        minimumFontSize,
+                        renderFontSize * (elWidth / widestLine) * 0.98
+                    );
+                    setRenderFont();
+                }
+            }
             context.fillStyle = el.fontColor;
-            context.textAlign = 'center';
+            const textAlign = ['left', 'center', 'right'].includes(el.textAlign)
+                ? el.textAlign
+                : 'center';
+            context.textAlign = textAlign;
             context.textBaseline = 'middle';
 
             // Word-wrap text within element width (respects manual line breaks)
             const lines = wrapText(context, elText, elWidth);
-            const lineHeight = el.fontSize * 1.05;
-            const totalHeight = (lines.length - 1) * lineHeight + el.fontSize;
+            const lineHeight = renderFontSize * (el.lineHeight || 1.05);
+            const totalHeight = (lines.length - 1) * lineHeight + renderFontSize;
 
             // Draw frame behind text if enabled
             if (el.frame && el.frame !== 'none') {
@@ -7487,9 +8099,14 @@ function drawElementsToContext(context, dims, elements, layer) {
             }
 
             // Draw text lines
-            const startY = -(totalHeight / 2) + el.fontSize / 2;
+            const startY = -(totalHeight / 2) + renderFontSize / 2;
+            const textX = textAlign === 'left'
+                ? -elWidth / 2
+                : textAlign === 'right'
+                    ? elWidth / 2
+                    : 0;
             lines.forEach((line, i) => {
-                context.fillText(line, 0, startY + i * lineHeight);
+                context.fillText(line, textX, startY + i * lineHeight);
             });
         }
 

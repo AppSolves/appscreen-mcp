@@ -19,7 +19,7 @@
 
     const knownOutputDevices = [
         'iphone-6.9', 'iphone-6.7', 'iphone-6.5', 'iphone-5.5',
-        'ipad-12.9', 'ipad-11',
+        'ipad-13', 'ipad-12.9', 'ipad-11',
         'android-phone', 'android-phone-hd', 'android-tablet-7', 'android-tablet-10',
         'web-og', 'web-twitter', 'web-hero', 'web-feature', 'custom'
     ];
@@ -328,6 +328,7 @@
                     imageBackgrounds: true,
                     twoDimensionalMockups: true,
                     threeDimensionalMockups: true,
+                    multipleDeviceInstancesPerScreenshot: true,
                     elements: true,
                     popouts: true,
                     aiTranslationViaAppSettings: true,
@@ -357,6 +358,44 @@
                 if (!name) throw new Error('Project name is required.');
                 await createProject(name);
                 return { id: currentProjectId, name };
+            });
+        },
+
+        async importPortableProject({ project }) {
+            return invoke('importPortableProject', async () => {
+                if (!project || typeof project !== 'object') {
+                    throw new Error('A portable AppScreen project object is required.');
+                }
+                if (!db) throw new Error('The project database is not ready.');
+
+                const dump = normalizeProjectImport(project);
+                const currentRecord = dump.meta?.find(record => record.key === 'currentProject');
+                const importedProjectId = currentRecord?.value;
+                if (!importedProjectId) throw new Error('The imported project has no project id.');
+                const previousProjectId = currentProjectId;
+
+                for (const storeName of Object.keys(dump)) {
+                    if (!db.objectStoreNames.contains(storeName)) continue;
+                    const tx = db.transaction(storeName, 'readwrite');
+                    const store = tx.objectStore(storeName);
+                    for (const record of dump[storeName]) store.put(record);
+                    await new Promise((resolve, reject) => {
+                        tx.oncomplete = resolve;
+                        tx.onerror = () => reject(tx.error);
+                    });
+                }
+
+                await loadProjectsMeta();
+                // loadProjectsMeta adopts the imported id immediately. Restore the
+                // previous id so switchProject does not save the old in-memory
+                // state over the newly imported database record.
+                currentProjectId = previousProjectId;
+                await switchProject(importedProjectId);
+                return {
+                    id: currentProjectId,
+                    screenshotCount: state.screenshots.length,
+                    languages: state.projectLanguages.slice()
+                };
             });
         },
 
@@ -475,6 +514,34 @@
             });
         },
 
+        async setSecondaryDevice({ index = state.selectedIndex, device } = {}) {
+            return invoke('setSecondaryDevice', async () => {
+                const s = ensureScreenshot(index);
+                if (!device?.screenshot) throw new Error('Secondary device settings are required.');
+                const localizedImages = {};
+                for (const [language, localized] of Object.entries(device.localizedImages || {})) {
+                    const source = localized?.src || localized?.dataUrl;
+                    if (!source) continue;
+                    const img = await loadImageFromDataUrl(source);
+                    localizedImages[language] = {
+                        image: img,
+                        src: source,
+                        name: localized.name || 'Device 2 content'
+                    };
+                    ensureLanguages([language]);
+                }
+                s.secondaryDevice = {
+                    name: device.name || 'Device 2',
+                    screenshot: clonePlain(device.screenshot),
+                    localizedImages
+                };
+                state.selectedIndex = Number(index);
+                selectedDeviceSlot = 'secondary';
+                refresh();
+                return { index: state.selectedIndex, secondaryDevice: stripRuntimeImages({ secondaryDevice: s.secondaryDevice }).secondaryDevice };
+            });
+        },
+
         async removeScreenshot({ index }) {
             return invoke('removeScreenshot', async () => {
                 const i = ensureIndex(index);
@@ -529,6 +596,53 @@
                 state.selectedIndex = Number(index);
                 refresh();
                 return { screenshot: clonePlain(s.screenshot) };
+            });
+        },
+
+        async setShared3DPair({ index = state.selectedIndex, enabled = true, gapPercent = null } = {}) {
+            return invoke('setShared3DPair', async () => {
+                const firstIndex = ensureIndex(index);
+                if (firstIndex >= state.screenshots.length - 1) {
+                    throw new Error('A multi-screen device needs a following screenshot.');
+                }
+
+                const first = ensureScreenshot(firstIndex);
+                const second = ensureScreenshot(firstIndex + 1);
+                const currentGroupId = first.screenshot.shared3DView?.groupId;
+                const currentMembers = typeof getShared3DGroupMembers === 'function'
+                    ? getShared3DGroupMembers(currentGroupId).sort((a, b) => a.index - b.index)
+                    : [];
+                const isRequestedPair = currentMembers.length === 2
+                    && currentMembers[0].index === firstIndex
+                    && currentMembers[1].index === firstIndex + 1;
+
+                if (enabled && !isRequestedPair) {
+                    if (currentGroupId && typeof unlinkShared3DGroup === 'function') {
+                        unlinkShared3DGroup(currentGroupId);
+                    }
+                    const secondGroupId = second.screenshot.shared3DView?.groupId;
+                    if (secondGroupId && typeof unlinkShared3DGroup === 'function') {
+                        unlinkShared3DGroup(secondGroupId);
+                    }
+
+                    state.selectedIndex = firstIndex;
+                    toggleShared3DWithNext();
+                } else if (!enabled && currentGroupId && typeof unlinkShared3DGroup === 'function') {
+                    unlinkShared3DGroup(currentGroupId);
+                }
+
+                if (enabled && gapPercent !== null && typeof setShared3DGapPercent === 'function') {
+                    state.selectedIndex = firstIndex;
+                    setShared3DGapPercent(gapPercent);
+                }
+
+                state.selectedIndex = firstIndex;
+                refresh();
+                return {
+                    enabled: Boolean(first.screenshot.shared3DView),
+                    indices: [firstIndex, firstIndex + 1],
+                    screenshots: [clonePlain(first.screenshot), clonePlain(second.screenshot)]
+                };
             });
         },
 

@@ -115,6 +115,10 @@ async function getPage(url = currentUrl) {
     browserContext = await chromium.launchPersistentContext(USER_DATA_DIR, {
       headless: HEADLESS,
       acceptDownloads: true,
+      // Playwright otherwise emulates a fixed 1280x720 viewport, even when the
+      // visible Chrome window is resized. A null viewport makes headed editing
+      // follow the native window while preserving the previous headless size.
+      viewport: HEADLESS ? { width: 1280, height: 720 } : null,
     });
 
     browserContext.setDefaultTimeout(BROWSER_TIMEOUT_MS);
@@ -293,7 +297,7 @@ registerTool(
   'appscreen_set_output_size',
   'Set the target output size. Use custom with width and height for arbitrary dimensions.',
   {
-    device: z.enum(['iphone-6.9', 'iphone-6.7', 'iphone-6.5', 'iphone-5.5', 'ipad-12.9', 'ipad-11', 'android-phone', 'android-phone-hd', 'android-tablet-7', 'android-tablet-10', 'web-og', 'web-twitter', 'web-hero', 'web-feature', 'custom']),
+    device: z.enum(['iphone-6.9', 'iphone-6.7', 'iphone-6.5', 'iphone-5.5', 'ipad-13', 'ipad-12.9', 'ipad-11', 'android-phone', 'android-phone-hd', 'android-tablet-7', 'android-tablet-10', 'web-og', 'web-twitter', 'web-hero', 'web-feature', 'custom']),
     width: z.number().positive().optional(),
     height: z.number().positive().optional(),
   },
@@ -487,6 +491,7 @@ Example screenshot item:
         'iphone-6.7',
         'iphone-6.5',
         'iphone-5.5',
+        'ipad-13',
         'ipad-12.9',
         'ipad-11',
         'android-phone',

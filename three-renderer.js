@@ -33,6 +33,9 @@ const deviceConfigs = {
         modelPath: 'models/iphone-15-pro-max.glb',
         aspectRatio: 1290 / 2796,
         screenHeightFactor: 0.826,
+        // Dark edge pixels need a tiny overscan to cover the model's bright
+        // front-glass seam. Bright screenshots retain the exact model fit.
+        darkScreenOverscan: 1.01,
         screenOffset: { x: 0.027, y: 0.745, z: 0.098 },
         positionOffsetFactor: 0.81,
         cornerRadiusFactor: 0.16,
@@ -42,6 +45,7 @@ const deviceConfigs = {
         modelPath: 'models/samsung-galaxy-s25-ultra.glb',
         aspectRatio: 1440 / 3120,
         screenHeightFactor: 0.66,
+        darkScreenOverscan: 1,
         screenOffset: { x: 0, y: 0.0, z: 0.08},  // Will need adjustment
         positionOffsetFactor: 0.5,
         cornerRadiusFactor: 0.04,
@@ -639,6 +643,54 @@ function createRoundedScreenImage(image, cornerRadius) {
     return canvas;
 }
 
+// Determine whether the screenshot itself reaches the device edge with a dark
+// color. Sampling the outer two rows/columns avoids treating dark content in
+// the middle of an otherwise bright screen as a dark-screen design.
+function getScreenEdgeLuminance(image) {
+    if (!image?.width || !image?.height) return 255;
+
+    const sampleSize = 32;
+    const edgeWidth = 2;
+    const canvas = document.createElement('canvas');
+    canvas.width = sampleSize;
+    canvas.height = sampleSize;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+    try {
+        ctx.drawImage(image, 0, 0, sampleSize, sampleSize);
+        const pixels = ctx.getImageData(0, 0, sampleSize, sampleSize).data;
+        let luminance = 0;
+        let samples = 0;
+
+        for (let y = 0; y < sampleSize; y++) {
+            for (let x = 0; x < sampleSize; x++) {
+                const isEdge = x < edgeWidth || x >= sampleSize - edgeWidth
+                    || y < edgeWidth || y >= sampleSize - edgeWidth;
+                if (!isEdge) continue;
+
+                const index = (y * sampleSize + x) * 4;
+                if (pixels[index + 3] < 128) continue;
+                luminance += 0.2126 * pixels[index]
+                    + 0.7152 * pixels[index + 1]
+                    + 0.0722 * pixels[index + 2];
+                samples++;
+            }
+        }
+
+        return samples ? luminance / samples : 255;
+    } catch (error) {
+        console.warn('Could not sample screenshot edge luminance:', error);
+        return 255;
+    }
+}
+
+function fitScreenPlaneToImage(screenPlane, image, config) {
+    if (!screenPlane) return;
+    const hasDarkEdge = getScreenEdgeLuminance(image) < 72;
+    const scale = hasDarkEdge ? (config.darkScreenOverscan || 1) : 1;
+    screenPlane.scale.set(scale, scale, 1);
+}
+
 // Update the screen texture with current screenshot
 function updateScreenTexture() {
     if (!phoneModel) return;
@@ -660,6 +712,7 @@ function updateScreenTexture() {
     const config = deviceConfigs[currentDeviceModel] || deviceConfigs.iphone;
     const cornerRadius = Math.round(screenshotImage.width * config.cornerRadiusFactor);
     const roundedImage = createRoundedScreenImage(screenshotImage, cornerRadius);
+    fitScreenPlaneToImage(customScreenPlane, screenshotImage, config);
 
     screenTexture = new THREE.Texture(roundedImage);
     screenTexture.needsUpdate = true;
@@ -733,6 +786,58 @@ function animateThreeJS() {
     requestThreeJSRender();
 }
 
+function configureCameraForScreenshot(dims, screenshotSettings) {
+    const originalProjection = {
+        aspect: threeCamera.aspect,
+        view: threeCamera.view?.enabled ? { ...threeCamera.view } : null
+    };
+
+    threeCamera.clearViewOffset();
+    const sharedView = screenshotSettings?.shared3DView;
+    const tileCount = Number(sharedView?.tileCount);
+    const tileIndex = Number(sharedView?.tileIndex);
+    const useSharedView = Number.isInteger(tileCount) && tileCount > 1
+        && Number.isInteger(tileIndex) && tileIndex >= 0 && tileIndex < tileCount;
+
+    if (useSharedView) {
+        const gapPercent = Math.max(0, Number(sharedView.gapPercent) || 0);
+        const gapWidth = dims.width * (gapPercent / 100);
+        const fullWidth = dims.width * tileCount + gapWidth * (tileCount - 1);
+        threeCamera.aspect = fullWidth / dims.height;
+        threeCamera.setViewOffset(
+            fullWidth,
+            dims.height,
+            (dims.width + gapWidth) * tileIndex,
+            0,
+            dims.width,
+            dims.height
+        );
+    } else {
+        threeCamera.aspect = dims.width / dims.height;
+        threeCamera.updateProjectionMatrix();
+    }
+
+    return originalProjection;
+}
+
+function restoreCameraProjection(originalProjection) {
+    threeCamera.clearViewOffset();
+    threeCamera.aspect = originalProjection.aspect;
+    if (originalProjection.view) {
+        const view = originalProjection.view;
+        threeCamera.setViewOffset(
+            view.fullWidth,
+            view.fullHeight,
+            view.offsetX,
+            view.offsetY,
+            view.width,
+            view.height
+        );
+    } else {
+        threeCamera.updateProjectionMatrix();
+    }
+}
+
 // Render 3D phone only (with transparent background) to be composited
 function renderThreeJSToCanvas(targetCanvas, width, height) {
     if (!threeRenderer || !threeScene || !threeCamera || !phonePivot) return;
@@ -746,9 +851,11 @@ function renderThreeJSToCanvas(targetCanvas, width, height) {
     const originalRotation = phonePivot.rotation.clone();
 
     // Apply position, scale, and rotation from screenshot settings
+    let screenshotSettings = null;
     if (typeof state !== 'undefined') {
         // Use getScreenshotSettings() helper if available, otherwise fall back to defaults
         const ss = typeof getScreenshotSettings === 'function' ? getScreenshotSettings() : state.defaults?.screenshot;
+        screenshotSettings = ss;
         if (ss) {
             // Scale: use screenshot.scale to adjust model size
             const screenshotScale = ss.scale / 100;
@@ -786,8 +893,7 @@ function renderThreeJSToCanvas(targetCanvas, width, height) {
     // Temporarily resize renderer
     const oldSize = { width: 400, height: 700 };
     threeRenderer.setSize(dims.width, dims.height);
-    threeCamera.aspect = dims.width / dims.height;
-    threeCamera.updateProjectionMatrix();
+    const originalProjection = configureCameraForScreenshot(dims, screenshotSettings);
 
     // Clear the renderer before drawing (ensures clean transparency)
     threeRenderer.clear();
@@ -801,8 +907,7 @@ function renderThreeJSToCanvas(targetCanvas, width, height) {
 
     // Restore size, background, and model transforms
     threeRenderer.setSize(oldSize.width, oldSize.height);
-    threeCamera.aspect = oldSize.width / oldSize.height;
-    threeCamera.updateProjectionMatrix();
+    restoreCameraProjection(originalProjection);
     threeScene.background = originalBackground;
     phonePivot.position.copy(originalPosition);
     phonePivot.scale.copy(originalScale);
@@ -810,12 +915,19 @@ function renderThreeJSToCanvas(targetCanvas, width, height) {
 }
 
 // Render 3D for a specific screenshot index (used for side previews)
-function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex) {
+function renderThreeJSForScreenshot(
+    targetCanvas,
+    width,
+    height,
+    screenshotIndex,
+    settingsOverride = null,
+    imageOverride = null
+) {
     if (!threeRenderer || !threeScene || !threeCamera) return;
     if (typeof state === 'undefined' || !state.screenshots[screenshotIndex]) return;
 
     const screenshot = state.screenshots[screenshotIndex];
-    const ss = screenshot.screenshot;
+    const ss = settingsOverride || screenshot.screenshot;
     const dims = { width: width || 1290, height: height || 2796 };
 
     // Determine which device model this screenshot uses
@@ -865,10 +977,11 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
 
     // Temporarily update screen texture for this screenshot
     // Use getScreenshotImage() for localized image support
-    const screenshotImage = typeof getScreenshotImage === 'function'
+    const screenshotImage = imageOverride || (typeof getScreenshotImage === 'function'
         ? getScreenshotImage(screenshot)
-        : screenshot?.image;
+        : screenshot?.image);
     const oldMaterial = screenPlaneToUse ? screenPlaneToUse.material : null;
+    const oldScreenScale = screenPlaneToUse ? screenPlaneToUse.scale.clone() : null;
     if (screenshotImage && screenPlaneToUse) {
         const cornerRadius = Math.round(screenshotImage.width * config.cornerRadiusFactor);
         const roundedImage = createRoundedScreenImage(screenshotImage, cornerRadius);
@@ -883,6 +996,7 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
             transparent: true
         });
         screenPlaneToUse.material = newMaterial;
+        fitScreenPlaneToImage(screenPlaneToUse, screenshotImage, config);
     }
 
     // Apply frame color for this screenshot
@@ -923,8 +1037,7 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
     // Temporarily resize renderer
     const oldSize = { width: 400, height: 700 };
     threeRenderer.setSize(dims.width, dims.height);
-    threeCamera.aspect = dims.width / dims.height;
-    threeCamera.updateProjectionMatrix();
+    const originalProjection = configureCameraForScreenshot(dims, ss);
 
     // Clear the renderer before drawing (ensures clean transparency)
     threeRenderer.clear();
@@ -938,8 +1051,7 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
 
     // Restore everything
     threeRenderer.setSize(oldSize.width, oldSize.height);
-    threeCamera.aspect = oldSize.width / oldSize.height;
-    threeCamera.updateProjectionMatrix();
+    restoreCameraProjection(originalProjection);
     threeScene.background = originalBackground;
     pivotToUse.position.copy(originalPosition);
     pivotToUse.scale.copy(originalScale);
@@ -953,6 +1065,9 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
             screenPlaneToUse.material.dispose();
         }
         screenPlaneToUse.material = oldMaterial;
+    }
+    if (oldScreenScale && screenPlaneToUse) {
+        screenPlaneToUse.scale.copy(oldScreenScale);
     }
 
     // Restore frame color on current model if we changed it
